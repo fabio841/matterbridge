@@ -42,11 +42,11 @@ func (b *Bwhatsapp) getSenderName(info types.MessageInfo) string {
 	var senderJid types.JID
 	senderJid.User, senderJid.Server = info.Sender.User, info.Sender.Server
 
-	sender, exists := b.contacts[senderJid]
+	sender, exists := b.contacts[senderJid.String()]
 
 	if !exists || (sender.FullName == "" && sender.FirstName == "") {
 		b.reloadContacts() // Contacts may need to be reloaded
-		sender, exists = b.contacts[senderJid]
+		sender, exists = b.contacts[senderJid.String()]
 	}
 
 	if exists && sender.FullName != "" {
@@ -65,11 +65,11 @@ func (b *Bwhatsapp) getSenderName(info types.MessageInfo) string {
 }
 
 func (b *Bwhatsapp) getSenderNameFromJID(senderJid types.JID) string {
-	sender, exists := b.contacts[senderJid]
+	sender, exists := b.contacts[senderJid.String()]
 
 	if !exists || (sender.FullName == "" && sender.FirstName == "") {
 		b.reloadContacts() // Contacts may need to be reloaded
-		sender, exists = b.contacts[senderJid]
+		sender, exists = b.contacts[senderJid.String()]
 	}
 
 	if exists && sender.FullName != "" {
@@ -88,11 +88,11 @@ func (b *Bwhatsapp) getSenderNameFromJID(senderJid types.JID) string {
 }
 
 func (b *Bwhatsapp) getSenderNotify(senderJid types.JID) string {
-	sender, exists := b.contacts[senderJid]
+	sender, exists := b.contacts[senderJid.String()]
 
 	if !exists || (sender.FullName == "" && sender.PushName == "" && sender.FirstName == "") {
 		b.reloadContacts() // Contacts may need to be reloaded
-		sender, exists = b.contacts[senderJid]
+		sender, exists = b.contacts[senderJid.String()]
 	}
 
 	if !exists {
@@ -130,7 +130,8 @@ func (b *Bwhatsapp) GetProfilePicThumb(jid string) (*types.ProfilePictureInfo, e
 func isGroupJid(identifier string) bool {
 	return strings.HasSuffix(identifier, "@g.us") ||
 		strings.HasSuffix(identifier, "@temp") ||
-		strings.HasSuffix(identifier, "@broadcast")
+		strings.HasSuffix(identifier, "@broadcast") ||
+		strings.HasSuffix(identifier, "@newsletter") // Supporto per i canali @newsletter
 }
 
 func (b *Bwhatsapp) getDevice() (*store.Device, error) {
@@ -157,7 +158,7 @@ func (b *Bwhatsapp) getNewReplyContext(parentID string) (*proto.ContextInfo, err
 
 	sender := fmt.Sprintf("%s@%s", replyInfo.Sender.User, replyInfo.Sender.Server)
 	ctx := &proto.ContextInfo{
-		StanzaID:      &replyInfo.MessageID,
+		StanzaId:      &replyInfo.MessageID,
 		Participant:   &sender,
 		QuotedMessage: &proto.Message{Conversation: goproto.String("")},
 	}
@@ -191,11 +192,11 @@ func (b *Bwhatsapp) parseMessageID(id string) (*Replyable, error) {
 }
 
 func getParentIdFromCtx(ci *proto.ContextInfo) string {
-	if ci != nil && ci.StanzaID != nil {
+	if ci != nil && ci.StanzaId != nil {
 		senderJid, err := types.ParseJID(*ci.Participant)
 
 		if err == nil {
-			return getMessageIdFormat(senderJid, *ci.StanzaID)
+			return getMessageIdFormat(senderJid, *ci.StanzaId)
 		}
 	}
 
