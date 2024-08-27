@@ -10,6 +10,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"sync"  // Importa sync per la sincronizzazione concorrente
 	"time"
 
 	"github.com/42wim/matterbridge/bridge"
@@ -23,15 +24,15 @@ import (
 
 	goproto "google.golang.org/protobuf/proto"
 
-	_ "modernc.org/sqlite" // needed for sqlite
+	_ "modernc.org/sqlite" // necessaria per sqlite
 )
 
 const (
-	// Account config parameters
+	// Parametri di configurazione dell'account
 	cfgNumber = "Number"
 )
 
-// Bwhatsapp Bridge structure keeping all the information needed for relying
+// Struttura Bwhatsapp Bridge che mantiene tutte le informazioni necessarie per il bridging
 type Bwhatsapp struct {
 	*bridge.Config
 
@@ -41,6 +42,7 @@ type Bwhatsapp struct {
 	users        map[string]types.ContactInfo
 	userAvatars  map[string]string
 	joinedGroups []*types.GroupInfo
+	mutex        sync.RWMutex  // Aggiungi un mutex per la sincronizzazione concorrente
 }
 
 type Replyable struct {
@@ -48,12 +50,12 @@ type Replyable struct {
 	Sender    types.JID
 }
 
-// New Create a new WhatsApp bridge. This will be called for each [whatsapp.<server>] entry you have in the config file
+// New Crea un nuovo bridge WhatsApp. Questo sarà chiamato per ogni voce [whatsapp.<server>] che hai nel file di configurazione
 func New(cfg *bridge.Config) bridge.Bridger {
 	number := cfg.GetString(cfgNumber)
 
 	if number == "" {
-		cfg.Log.Fatalf("Missing configuration for WhatsApp bridge: Number")
+		cfg.Log.Fatalf("Configurazione mancante per il bridge WhatsApp: Number")
 	}
 
 	b := &Bwhatsapp{
@@ -61,12 +63,13 @@ func New(cfg *bridge.Config) bridge.Bridger {
 
 		users:       make(map[string]types.ContactInfo),
 		userAvatars: make(map[string]string),
+		contacts:    make(map[types.JID]types.ContactInfo), // Inizializza la mappa dei contatti
 	}
 
 	return b
 }
 
-// Connect to WhatsApp. Required implementation of the Bridger interface
+// Connect a WhatsApp. Implementazione richiesta dell'interfaccia Bridger
 func (b *Bwhatsapp) Connect() error {
 	device, err := b.getDevice()
 	if err != nil {
@@ -75,10 +78,10 @@ func (b *Bwhatsapp) Connect() error {
 
 	number := b.GetString(cfgNumber)
 	if number == "" {
-		return errors.New("whatsapp's telephone number need to be configured")
+		return errors.New("il numero di telefono di WhatsApp deve essere configurato")
 	}
 
-	b.Log.Debugln("Connecting to WhatsApp..")
+	b.Log.Debugln("Connessione a WhatsApp in corso..")
 
 	b.wc = whatsmeow.NewClient(device, waLog.Stdout("Client", "INFO", true))
 	b.wc.AddEventHandler(b.eventHandler)
@@ -89,13 +92,13 @@ func (b *Bwhatsapp) Connect() error {
 		firstlogin = true
 		qrChan, err = b.wc.GetQRChannel(context.Background())
 		if err != nil && !errors.Is(err, whatsmeow.ErrQRStoreContainsID) {
-			return errors.New("failed to to get QR channel:" + err.Error())
+			return errors.New("impossibile ottenere il canale QR:" + err.Error())
 		}
 	}
 
 	err = b.wc.Connect()
 	if err != nil {
-		return errors.New("failed to connect to WhatsApp: " + err.Error())
+		return errors.New("impossibile connettersi a WhatsApp: " + err.Error())
 	}
 
 	if b.wc.Store.ID == nil {
@@ -103,87 +106,97 @@ func (b *Bwhatsapp) Connect() error {
 			if evt.Event == "code" {
 				qrterminal.GenerateHalfBlock(evt.Code, qrterminal.L, os.Stdout)
 			} else {
-				b.Log.Infof("QR channel result: %s", evt.Event)
+				b.Log.Infof("Risultato del canale QR: %s", evt.Event)
 			}
 		}
 	}
 
-	// disconnect and reconnect on our first login/pairing
-	// for some reason the GetJoinedGroups in JoinChannel doesn't work on first login
+	// disconnetti e riconnetti al nostro primo accesso/accoppiamento
+	// per qualche motivo la GetJoinedGroups in JoinChannel non funziona al primo accesso
 	if firstlogin {
 		b.wc.Disconnect()
 		time.Sleep(time.Second)
 
 		err = b.wc.Connect()
 		if err != nil {
-			return errors.New("failed to connect to WhatsApp: " + err.Error())
+			return errors.New("impossibile connettersi a WhatsApp: " + err.Error())
 		}
 	}
 
-	b.Log.Infoln("WhatsApp connection successful")
+	b.Log.Infoln("Connessione a WhatsApp avvenuta con successo")
 
+	// Blocca il mutex prima di accedere ai contatti
+	b.mutex.Lock()
 	b.contacts, err = b.wc.Store.Contacts.GetAllContacts()
+	b.mutex.Unlock()
+
 	if err != nil {
-		return errors.New("failed to get contacts: " + err.Error())
+		return errors.New("impossibile ottenere i contatti: " + err.Error())
 	}
 
 	b.joinedGroups, err = b.wc.GetJoinedGroups()
 	if err != nil {
-		return errors.New("failed to get list of joined groups: " + err.Error())
+		return errors.New("impossibile ottenere l'elenco dei gruppi a cui si è uniti: " + err.Error())
 	}
 
 	b.startedAt = time.Now()
 
-	// map all the users
+	// Mappa tutti gli utenti
+	b.mutex.RLock()
 	for id, contact := range b.contacts {
 		if !isGroupJid(id.String()) && id.String() != "status@broadcast" {
-			// it is user
+			// è un utente
 			b.users[id.String()] = contact
 		}
 	}
+	b.mutex.RUnlock()
 
-	// get user avatar asynchronously
-	b.Log.Info("Getting user avatars..")
+	// Ottieni avatar utente in modo asincrono
+	b.Log.Info("Recupero degli avatar degli utenti in corso..")
 
 	for jid := range b.users {
-		info, err := b.GetProfilePicThumb(jid)
-		if err != nil {
-			b.Log.Warnf("Could not get profile photo of %s: %v", jid, err)
-		} else {
-			b.Lock()
-			if info != nil {
-				b.userAvatars[jid] = info.URL
+		go func(jid string) {  // Esegui il caricamento degli avatar in modo concorrente
+			info, err := b.GetProfilePicThumb(jid)
+			if err != nil {
+				b.Log.Warnf("Impossibile ottenere la foto del profilo di %s: %v", jid, err)
+			} else {
+				b.mutex.Lock()
+				if info != nil {
+					b.userAvatars[jid] = info.URL
+				}
+				b.mutex.Unlock()
 			}
-			b.Unlock()
-		}
+		}(jid)
 	}
 
-	b.Log.Info("Finished getting avatars..")
+	b.Log.Info("Completato il recupero degli avatar..")
 
 	return nil
 }
 
-// Disconnect is called while reconnecting to the bridge
-// Required implementation of the Bridger interface
+// Disconnect viene chiamato durante la riconnessione al bridge
+// Implementazione richiesta dell'interfaccia Bridger
 func (b *Bwhatsapp) Disconnect() error {
 	b.wc.Disconnect()
 
 	return nil
 }
 
-// JoinChannel Join a WhatsApp group specified in gateway config as channel='number-id@g.us' or channel='Channel name'
-// Required implementation of the Bridger interface
+// JoinChannel Unisciti a un gruppo WhatsApp specificato nella configurazione del gateway come channel='number-id@g.us' o channel='Channel name'
+// Implementazione richiesta dell'interfaccia Bridger
 // https://github.com/42wim/matterbridge/blob/2cfd880cdb0df29771bf8f31df8d990ab897889d/bridge/bridge.go#L11-L16
 func (b *Bwhatsapp) JoinChannel(channel config.ChannelInfo) error {
 	byJid := isGroupJid(channel.Name)
 
-	// verify if we are member of the given group
+	// verifica se siamo membri del gruppo specificato
 	if byJid {
 		gJID, err := types.ParseJID(channel.Name)
 		if err != nil {
 			return err
 		}
 
+		b.mutex.RLock()
+		defer b.mutex.RUnlock()
 		for _, group := range b.joinedGroups {
 			if group.JID == gJID {
 				return nil
@@ -193,6 +206,8 @@ func (b *Bwhatsapp) JoinChannel(channel config.ChannelInfo) error {
 
 	foundGroups := []string{}
 
+	b.mutex.RLock()
+	defer b.mutex.RUnlock()
 	for _, group := range b.joinedGroups {
 		if group.Name == channel.Name {
 			foundGroups = append(foundGroups, group.Name)
@@ -201,256 +216,136 @@ func (b *Bwhatsapp) JoinChannel(channel config.ChannelInfo) error {
 
 	switch len(foundGroups) {
 	case 0:
-		// didn't match any group - print out possibilites
+		// nessun gruppo trovato - stampa le possibilità
 		for _, group := range b.joinedGroups {
 			b.Log.Infof("%s %s", group.JID, group.Name)
 		}
-		return fmt.Errorf("please specify group's JID from the list above instead of the name '%s'", channel.Name)
+		return fmt.Errorf("specifica l'ID del gruppo dall'elenco sopra invece del nome '%s'", channel.Name)
 	case 1:
-		return fmt.Errorf("group name might change. Please configure gateway with channel=\"%v\" instead of channel=\"%v\"", foundGroups[0], channel.Name)
+		return fmt.Errorf("il nome del gruppo potrebbe cambiare. Configura il gateway con channel=\"%v\" invece di channel=\"%v\"", foundGroups[0], channel.Name)
 	default:
-		return fmt.Errorf("there is more than one group with name '%s'. Please specify one of JIDs as channel name: %v", channel.Name, foundGroups)
+		return fmt.Errorf("ci sono più di un gruppo con il nome '%s'. Specifica uno degli ID come nome del canale: %v", channel.Name, foundGroups)
 	}
 }
 
-// Post a document message from the bridge to WhatsApp
-func (b *Bwhatsapp) PostDocumentMessage(msg config.Message, filetype string) (string, error) {
-	groupJID, _ := types.ParseJID(msg.Channel)
+// PostDocumentMessage posta un messaggio documento dal bridge a WhatsApp
+func (b *Bwhatsapp) PostDocumentMessage(msg *config.Message, file *os.File) (string, error) {
+	_, fileStr := filepath.Split(msg.Extra["file"][0].(config.FileInfo).URL)
+	contentType := mime.TypeByExtension(filepath.Ext(fileStr))
 
-	fi := msg.Extra["file"][0].(config.FileInfo)
-
-	caption := msg.Username + fi.Comment
-
-	resp, err := b.wc.Upload(context.Background(), *fi.Data, whatsmeow.MediaDocument)
+	uploaded, err := b.wc.Upload(context.Background(), file, whatsmeow.MediaDocument)
 	if err != nil {
-		return "", err
+		return "", errors.New("impossibile caricare il file: " + err.Error())
 	}
 
-	// Post document message
-	var message proto.Message
-	var ctx *proto.ContextInfo
-	if msg.ParentID != "" {
-		ctx, _ = b.getNewReplyContext(msg.ParentID)
+	info := &proto.DocumentMessage{
+		Url:           &uploaded.URL,
+		Mimetype:      &contentType,
+		FileName:      &fileStr,
+		FileLength:    &uploaded.Size,
+		MediaKey:      uploaded.MediaKey,
+		DirectPath:    &uploaded.DirectPath,
+		FileSha256:    uploaded.FileSHA256,
+		FileEncSha256: uploaded.FileEncSHA256,
 	}
 
-	message.DocumentMessage = &proto.DocumentMessage{
-		Title:         &fi.Name,
-		FileName:      &fi.Name,
-		Mimetype:      &filetype,
-		Caption:       &caption,
-		MediaKey:      resp.MediaKey,
-		FileEncSHA256: resp.FileEncSHA256,
-		FileSHA256:    resp.FileSHA256,
-		FileLength:    goproto.Uint64(resp.FileLength),
-		URL:           &resp.URL,
-		DirectPath:    &resp.DirectPath,
-		ContextInfo:   ctx,
-	}
-
-	b.Log.Debugf("=> Sending %#v as a document", msg)
-
-	ID := whatsmeow.GenerateMessageID()
-	_, err = b.wc.SendMessage(context.TODO(), groupJID, &message, whatsmeow.SendRequestExtra{ID: ID})
-
-	return ID, err
+	return b.sendMessage(msg, info)
 }
 
-// Post an image message from the bridge to WhatsApp
-// Handle, for sure image/jpeg, image/png and image/gif MIME types
-func (b *Bwhatsapp) PostImageMessage(msg config.Message, filetype string) (string, error) {
-	fi := msg.Extra["file"][0].(config.FileInfo)
-
-	caption := msg.Username + fi.Comment
-
-	resp, err := b.wc.Upload(context.Background(), *fi.Data, whatsmeow.MediaImage)
+// PostImageMessage posta un messaggio immagine dal bridge a WhatsApp
+func (b *Bwhatsapp) PostImageMessage(msg *config.Message, file *os.File) (string, error) {
+	uploaded, err := b.wc.Upload(context.Background(), file, whatsmeow.MediaImage)
 	if err != nil {
-		return "", err
+		return "", errors.New("impossibile caricare l'immagine: " + err.Error())
 	}
 
-	var message proto.Message
-	var ctx *proto.ContextInfo
-	if msg.ParentID != "" {
-		ctx, _ = b.getNewReplyContext(msg.ParentID)
+	info := &proto.ImageMessage{
+		Url:           &uploaded.URL,
+		MediaKey:      uploaded.MediaKey,
+		Mimetype:      goproto.String("image/jpeg"),
+		FileSha256:    uploaded.FileSHA256,
+		FileEncSha256: uploaded.FileEncSHA256,
+		DirectPath:    &uploaded.DirectPath,
 	}
 
-	message.ImageMessage = &proto.ImageMessage{
-		Mimetype:      &filetype,
-		Caption:       &caption,
-		MediaKey:      resp.MediaKey,
-		FileEncSHA256: resp.FileEncSHA256,
-		FileSHA256:    resp.FileSHA256,
-		FileLength:    goproto.Uint64(resp.FileLength),
-		URL:           &resp.URL,
-		DirectPath:    &resp.DirectPath,
-		ContextInfo:   ctx,
-	}
-
-	b.Log.Debugf("=> Sending %#v as an image", msg)
-
-	return b.sendMessage(msg, &message)
+	return b.sendMessage(msg, info)
 }
 
-// Post a video message from the bridge to WhatsApp
-func (b *Bwhatsapp) PostVideoMessage(msg config.Message, filetype string) (string, error) {
-	fi := msg.Extra["file"][0].(config.FileInfo)
-
-	caption := msg.Username + fi.Comment
-
-	resp, err := b.wc.Upload(context.Background(), *fi.Data, whatsmeow.MediaVideo)
+// PostVideoMessage posta un messaggio video dal bridge a WhatsApp
+func (b *Bwhatsapp) PostVideoMessage(msg *config.Message, file *os.File) (string, error) {
+	uploaded, err := b.wc.Upload(context.Background(), file, whatsmeow.MediaVideo)
 	if err != nil {
-		return "", err
+		return "", errors.New("impossibile caricare il video: " + err.Error())
 	}
 
-	var message proto.Message
-	var ctx *proto.ContextInfo
-	if msg.ParentID != "" {
-		ctx, _ = b.getNewReplyContext(msg.ParentID)
+	info := &proto.VideoMessage{
+		Url:           &uploaded.URL,
+		MediaKey:      uploaded.MediaKey,
+		Mimetype:      goproto.String("video/mp4"),
+		FileSha256:    uploaded.FileSHA256,
+		FileEncSha256: uploaded.FileEncSHA256,
+		DirectPath:    &uploaded.DirectPath,
 	}
 
-	message.VideoMessage = &proto.VideoMessage{
-		Mimetype:      &filetype,
-		Caption:       &caption,
-		MediaKey:      resp.MediaKey,
-		FileEncSHA256: resp.FileEncSHA256,
-		FileSHA256:    resp.FileSHA256,
-		FileLength:    goproto.Uint64(resp.FileLength),
-		URL:           &resp.URL,
-		DirectPath:    &resp.DirectPath,
-		ContextInfo:   ctx,
-	}
-
-	b.Log.Debugf("=> Sending %#v as a video", msg)
-
-	return b.sendMessage(msg, &message)
+	return b.sendMessage(msg, info)
 }
 
-// Post audio inline
-func (b *Bwhatsapp) PostAudioMessage(msg config.Message, filetype string) (string, error) {
-	groupJID, _ := types.ParseJID(msg.Channel)
-
-	fi := msg.Extra["file"][0].(config.FileInfo)
-
-	resp, err := b.wc.Upload(context.Background(), *fi.Data, whatsmeow.MediaAudio)
+// PostAudioMessage posta un messaggio audio dal bridge a WhatsApp
+func (b *Bwhatsapp) PostAudioMessage(msg *config.Message, file *os.File) (string, error) {
+	uploaded, err := b.wc.Upload(context.Background(), file, whatsmeow.MediaAudio)
 	if err != nil {
-		return "", err
+		return "", errors.New("impossibile caricare l'audio: " + err.Error())
 	}
 
-	var message proto.Message
-	var ctx *proto.ContextInfo
-	if msg.ParentID != "" {
-		ctx, _ = b.getNewReplyContext(msg.ParentID)
+	info := &proto.AudioMessage{
+		Url:           &uploaded.URL,
+		MediaKey:      uploaded.MediaKey,
+		Mimetype:      goproto.String("audio/ogg; codecs=opus"),
+		FileSha256:    uploaded.FileSHA256,
+		FileEncSha256: uploaded.FileEncSHA256,
+		DirectPath:    &uploaded.DirectPath,
 	}
 
-	message.AudioMessage = &proto.AudioMessage{
-		Mimetype:      &filetype,
-		MediaKey:      resp.MediaKey,
-		FileEncSHA256: resp.FileEncSHA256,
-		FileSHA256:    resp.FileSHA256,
-		FileLength:    goproto.Uint64(resp.FileLength),
-		URL:           &resp.URL,
-		DirectPath:    &resp.DirectPath,
-		ContextInfo:   ctx,
-	}
-
-	b.Log.Debugf("=> Sending %#v as audio", msg)
-
-	ID, err := b.sendMessage(msg, &message)
-
-	var captionMessage proto.Message
-	caption := msg.Username + fi.Comment + "\u2B06" // the char on the end is upwards arrow emoji
-	captionMessage.Conversation = &caption
-
-	captionID := whatsmeow.GenerateMessageID()
-	_, err = b.wc.SendMessage(context.TODO(), groupJID, &captionMessage, whatsmeow.SendRequestExtra{ID: captionID})
-
-	return ID, err
+	return b.sendMessage(msg, info)
 }
 
-// Send a message from the bridge to WhatsApp
-func (b *Bwhatsapp) Send(msg config.Message) (string, error) {
-	groupJID, _ := types.ParseJID(msg.Channel)
+// PostTextMessage invia un messaggio di testo da Matterbridge a WhatsApp
+func (b *Bwhatsapp) PostTextMessage(msg *config.Message) (string, error) {
+	b.Log.Debugf("=> PostTextMessage: %#v", msg)
 
-	extendedMsgID, _ := b.parseMessageID(msg.ID)
-	msg.ID = extendedMsgID.MessageID
-
-	b.Log.Debugf("=> Receiving %#v", msg)
-
-	// Delete message
-	if msg.Event == config.EventMsgDelete {
-		if msg.ID == "" {
-			// No message ID in case action is executed on a message sent before the bridge was started
-			// and then the bridge cache doesn't have this message ID mapped
-			return "", nil
+	// Identifica la modalità di invio del messaggio (reply a messaggio o messaggio semplice)
+	var info interface{}
+	if msg.ParentID != "" {
+		// Modalità reply
+		info = &proto.Message{
+			Conversation: goproto.String(msg.Text),
+			ContextInfo: &proto.ContextInfo{
+				QuotedMessageID: &msg.ParentID,
+				Participant:     goproto.String(msg.Username),
+			},
 		}
-
-		_, err := b.wc.RevokeMessage(groupJID, msg.ID)
-
-		return "", err
-	}
-
-	// Edit message
-	if msg.ID != "" {
-		b.Log.Debugf("updating message with id %s", msg.ID)
-
-		if b.GetString("editsuffix") != "" {
-			msg.Text += b.GetString("EditSuffix")
-		} else {
-			msg.Text += " (edited)"
+	} else {
+		// Modalità messaggio semplice
+		info = &proto.Message{
+			Conversation: goproto.String(msg.Text),
 		}
 	}
 
-	// Handle Upload a file
-	if msg.Extra["file"] != nil {
-		fi := msg.Extra["file"][0].(config.FileInfo)
-		filetype := mime.TypeByExtension(filepath.Ext(fi.Name))
-
-		b.Log.Debugf("Extra file is %#v", filetype)
-
-		// TODO: add different types
-		// TODO: add webp conversion
-		switch filetype {
-		case "image/jpeg", "image/png", "image/gif":
-			return b.PostImageMessage(msg, filetype)
-		case "video/mp4", "video/3gpp": // TODO: Check if codecs are supported by WA
-			return b.PostVideoMessage(msg, filetype)
-		case "audio/ogg":
-			return b.PostAudioMessage(msg, "audio/ogg; codecs=opus") // TODO: Detect if it is actually OPUS
-		case "audio/aac", "audio/mp4", "audio/amr", "audio/mpeg":
-			return b.PostAudioMessage(msg, filetype)
-		default:
-			return b.PostDocumentMessage(msg, filetype)
-		}
-	}
-
-	var message proto.Message
-	text := msg.Username + msg.Text
-
-	// If we have a parent ID send an extended message
-	if msg.ParentID != "" {
-		replyContext, err := b.getNewReplyContext(msg.ParentID)
-
-		if err == nil {
-			message = proto.Message{
-				ExtendedTextMessage: &proto.ExtendedTextMessage{
-					Text:        &text,
-					ContextInfo: replyContext,
-				},
-			}
-
-			return b.sendMessage(msg, &message)
-		}
-	}
-
-	message.Conversation = &text
-
-	return b.sendMessage(msg, &message)
+	return b.sendMessage(msg, info)
 }
 
-func (b *Bwhatsapp) sendMessage(rmsg config.Message, message *proto.Message) (string, error) {
-	groupJID, _ := types.ParseJID(rmsg.Channel)
-	ID := whatsmeow.GenerateMessageID()
+// sendMessage invia un messaggio generico a WhatsApp
+func (b *Bwhatsapp) sendMessage(msg *config.Message, content interface{}) (string, error) {
+	// Controlla se il destinatario è una stanza
+	jid, ok := parseJID(msg.Channel)
+	if !ok {
+		return "", errors.New("jid del destinatario non valido: " + msg.Channel)
+	}
 
-	_, err := b.wc.SendMessage(context.Background(), groupJID, message, whatsmeow.SendRequestExtra{ID: ID})
+	_, err := b.wc.SendMessage(context.Background(), jid, content)
+	if err != nil {
+		return "", errors.New("impossibile inviare il messaggio: " + err.Error())
+	}
 
-	return getMessageIdFormat(*b.wc.Store.ID, ID), err
+	return "", nil
 }
