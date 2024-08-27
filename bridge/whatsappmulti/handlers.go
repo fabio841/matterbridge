@@ -53,7 +53,15 @@ func (b *Bwhatsapp) handleUserJoin(event *events.GroupInfo) {
 			Text:     "joined chat",
 		}
 
-		b.Remote <- rmsg
+		b.mutex.RLock()
+		avatarURL, exists := b.userAvatars[joinedJid.String()]
+		b.mutex.RUnlock()
+		if exists {
+			rmsg.Avatar = avatarURL
+		}
+
+		b.Log.Debugf("<= Sending user join message from %s on %s to gateway", joinedJid, b.Account)
+		b.PostTextMessage(&rmsg) // Usare la funzione PostTextMessage per inviare il messaggio
 	}
 }
 
@@ -71,7 +79,15 @@ func (b *Bwhatsapp) handleUserLeave(event *events.GroupInfo) {
 			Text:     "left chat",
 		}
 
-		b.Remote <- rmsg
+		b.mutex.RLock()
+		avatarURL, exists := b.userAvatars[leftJid.String()]
+		b.mutex.RUnlock()
+		if exists {
+			rmsg.Avatar = avatarURL
+		}
+
+		b.Log.Debugf("<= Sending user leave message from %s on %s to gateway", leftJid, b.Account)
+		b.PostTextMessage(&rmsg) // Usare la funzione PostTextMessage per inviare il messaggio
 	}
 }
 
@@ -95,7 +111,15 @@ func (b *Bwhatsapp) handleTopicChange(event *events.GroupInfo) {
 		Text:     "Topic changed: " + text,
 	}
 
-	b.Remote <- rmsg
+	b.mutex.RLock()
+	avatarURL, exists := b.userAvatars[senderJid.String()]
+	b.mutex.RUnlock()
+	if exists {
+		rmsg.Avatar = avatarURL
+	}
+
+	b.Log.Debugf("<= Sending topic change message from %s on %s to gateway", senderJid, b.Account)
+	b.PostTextMessage(&rmsg) // Usare la funzione PostTextMessage per inviare il messaggio
 }
 
 func (b *Bwhatsapp) handleMessage(message *events.Message) {
@@ -184,17 +208,17 @@ func (b *Bwhatsapp) handleTextMessage(messageInfo types.MessageInfo, msg *proto.
 		ParentID: parentID,
 	}
 
+	b.mutex.RLock()
 	if avatarURL, exists := b.userAvatars[senderJID.String()]; exists {
 		rmsg.Avatar = avatarURL
 	}
+	b.mutex.RUnlock()
 
-	b.Log.Debugf("<= Sending message from %s on %s to gateway", senderJID, b.Account)
-	b.Log.Debugf("<= Message is %#v", rmsg)
-
-	b.Remote <- rmsg
+	b.Log.Debugf("<= Sending text message from %s on %s to gateway", senderJID, b.Account)
+	b.PostTextMessage(&rmsg) // Usare la funzione PostTextMessage per inviare il messaggio
 }
 
-// HandleImageMessage sent from WhatsApp, relay it to the brige
+// HandleImageMessage sent from WhatsApp, relay it to the bridge
 func (b *Bwhatsapp) handleImageMessage(msg *events.Message) {
 	imsg := msg.Message.GetImageMessage()
 
@@ -217,125 +241,49 @@ func (b *Bwhatsapp) handleImageMessage(msg *events.Message) {
 		ParentID: getParentIdFromCtx(ci),
 	}
 
+	b.mutex.RLock()
 	if avatarURL, exists := b.userAvatars[senderJID.String()]; exists {
 		rmsg.Avatar = avatarURL
 	}
+	b.mutex.RUnlock()
 
-	fileExt, err := mime.ExtensionsByType(imsg.GetMimetype())
+	// Download the image
+	data, err := b.wc.Download(msg.Info.MessageSource, imsg)
 	if err != nil {
-		b.Log.Errorf("Mimetype detection error: %s", err)
-
+		b.Log.Errorf("image download failed: %s", err)
 		return
 	}
 
-	// rename .jfif to .jpg https://github.com/42wim/matterbridge/issues/1292
-	if fileExt[0] == ".jfif" {
-		fileExt[0] = ".jpg"
-	}
+	rmsg.Text = imsg.GetCaption()
 
-	// rename .jpe to .jpg https://github.com/42wim/matterbridge/issues/1463
-	if fileExt[0] == ".jpe" {
-		fileExt[0] = ".jpg"
-	}
-
-	filename := fmt.Sprintf("%v%v", msg.Info.ID, fileExt[0])
-
-	b.Log.Debugf("Trying to download %s with type %s", filename, imsg.GetMimetype())
-
-	data, err := b.wc.Download(imsg)
-	if err != nil {
-		b.Log.Errorf("Download image failed: %s", err)
-
-		return
-	}
-
-	// Move file to bridge storage
-	helper.HandleDownloadData(b.Log, &rmsg, filename, imsg.GetCaption(), "", &data, b.General)
-
-	b.Log.Debugf("<= Sending message from %s on %s to gateway", senderJID, b.Account)
-	b.Log.Debugf("<= Message is %#v", rmsg)
-
-	b.Remote <- rmsg
-}
-
-// HandleVideoMessage downloads video messages
-func (b *Bwhatsapp) handleVideoMessage(msg *events.Message) {
-	imsg := msg.Message.GetVideoMessage()
-
-	senderJID := msg.Info.Sender
-	senderName := b.getSenderName(msg.Info)
-	ci := imsg.GetContextInfo()
-
-	if senderJID == (types.JID{}) && ci.Participant != nil {
-		senderJID = types.NewJID(ci.GetParticipant(), types.DefaultUserServer)
-	}
-
-	rmsg := config.Message{
-		UserID:   senderJID.String(),
-		Username: senderName,
-		Channel:  msg.Info.Chat.String(),
-		Account:  b.Account,
-		Protocol: b.Protocol,
-		Extra:    make(map[string][]interface{}),
-		ID:       getMessageIdFormat(senderJID, msg.Info.ID),
-		ParentID: getParentIdFromCtx(ci),
-	}
-
-	if avatarURL, exists := b.userAvatars[senderJID.String()]; exists {
-		rmsg.Avatar = avatarURL
-	}
-
-	fileExt, err := mime.ExtensionsByType(imsg.GetMimetype())
-	if err != nil {
-		b.Log.Errorf("Mimetype detection error: %s", err)
-
-		return
-	}
-
-	if len(fileExt) == 0 {
-		fileExt = append(fileExt, ".mp4")
-	}
-
-	// Prefer .mp4 extension, otherwise fallback to first index
-	fileExtIndex := 0
-	for i, n := range fileExt {
-		if ".mp4" == n {
-			fileExtIndex = i
-			break
+	// Try to get the image extension from the file header
+	ext := helper.GetFileExtension(data)
+	if ext == ".bin" {
+		// If not possible, try to get the extension from the mimetype
+		exts, err := mime.ExtensionsByType(imsg.GetMimetype())
+		if err == nil {
+			ext = exts[0]
 		}
 	}
 
-	filename := fmt.Sprintf("%v%v", msg.Info.ID, fileExt[fileExtIndex])
-
-	b.Log.Debugf("Trying to download %s with size %#v and type %s", filename, imsg.GetFileLength(), imsg.GetMimetype())
-
-	data, err := b.wc.Download(imsg)
-	if err != nil {
-		b.Log.Errorf("Download video failed: %s", err)
-
-		return
-	}
-
-	// Move file to bridge storage
-	helper.HandleDownloadData(b.Log, &rmsg, filename, imsg.GetCaption(), "", &data, b.General)
-
-	b.Log.Debugf("<= Sending message from %s on %s to gateway", senderJID, b.Account)
-	b.Log.Debugf("<= Message is %#v", rmsg)
-
-	b.Remote <- rmsg
+	comment := "image " + msg.Info.ID + ext
+	helper.HandleDownloadData(b.Log, &rmsg, comment, imsg.GetMimetype(), data, b.General)
+	b.Log.Debugf("<= Sending image message from %s on %s to gateway", senderJID, b.Account)
+	b.PostImageMessage(&rmsg) // Usare la funzione PostImageMessage per inviare il messaggio
 }
 
-// HandleAudioMessage downloads audio messages
-func (b *Bwhatsapp) handleAudioMessage(msg *events.Message) {
-	imsg := msg.Message.GetAudioMessage()
+// HandleVideoMessage sent from WhatsApp, relay it to the bridge
+func (b *Bwhatsapp) handleVideoMessage(msg *events.Message) {
+	vmsg := msg.Message.GetVideoMessage()
 
 	senderJID := msg.Info.Sender
 	senderName := b.getSenderName(msg.Info)
-	ci := imsg.GetContextInfo()
+	ci := vmsg.GetContextInfo()
 
 	if senderJID == (types.JID{}) && ci.Participant != nil {
 		senderJID = types.NewJID(ci.GetParticipant(), types.DefaultUserServer)
 	}
+
 	rmsg := config.Message{
 		UserID:   senderJID.String(),
 		Username: senderName,
@@ -347,48 +295,44 @@ func (b *Bwhatsapp) handleAudioMessage(msg *events.Message) {
 		ParentID: getParentIdFromCtx(ci),
 	}
 
+	b.mutex.RLock()
 	if avatarURL, exists := b.userAvatars[senderJID.String()]; exists {
 		rmsg.Avatar = avatarURL
 	}
+	b.mutex.RUnlock()
 
-	fileExt, err := mime.ExtensionsByType(imsg.GetMimetype())
+	// Download the video
+	data, err := b.wc.Download(msg.Info.MessageSource, vmsg)
 	if err != nil {
-		b.Log.Errorf("Mimetype detection error: %s", err)
-
+		b.Log.Errorf("video download failed: %s", err)
 		return
 	}
 
-	if len(fileExt) == 0 {
-		fileExt = append(fileExt, ".ogg")
+	rmsg.Text = vmsg.GetCaption()
+
+	// Try to get the video extension from the file header
+	ext := helper.GetFileExtension(data)
+	if ext == ".bin" {
+		// If not possible, try to get the extension from the mimetype
+		exts, err := mime.ExtensionsByType(vmsg.GetMimetype())
+		if err == nil {
+			ext = exts[0]
+		}
 	}
 
-	filename := fmt.Sprintf("%v%v", msg.Info.ID, fileExt[0])
-
-	b.Log.Debugf("Trying to download %s with size %#v and type %s", filename, imsg.GetFileLength(), imsg.GetMimetype())
-
-	data, err := b.wc.Download(imsg)
-	if err != nil {
-		b.Log.Errorf("Download video failed: %s", err)
-
-		return
-	}
-
-	// Move file to bridge storage
-	helper.HandleDownloadData(b.Log, &rmsg, filename, "audio message", "", &data, b.General)
-
-	b.Log.Debugf("<= Sending message from %s on %s to gateway", senderJID, b.Account)
-	b.Log.Debugf("<= Message is %#v", rmsg)
-
-	b.Remote <- rmsg
+	comment := "video " + msg.Info.ID + ext
+	helper.HandleDownloadData(b.Log, &rmsg, comment, vmsg.GetMimetype(), data, b.General)
+	b.Log.Debugf("<= Sending video message from %s on %s to gateway", senderJID, b.Account)
+	b.PostVideoMessage(&rmsg) // Usare la funzione PostVideoMessage per inviare il messaggio
 }
 
-// HandleDocumentMessage downloads documents
+// HandleDocumentMessage sent from WhatsApp, relay it to the bridge
 func (b *Bwhatsapp) handleDocumentMessage(msg *events.Message) {
-	imsg := msg.Message.GetDocumentMessage()
+	dmsg := msg.Message.GetDocumentMessage()
 
 	senderJID := msg.Info.Sender
 	senderName := b.getSenderName(msg.Info)
-	ci := imsg.GetContextInfo()
+	ci := dmsg.GetContextInfo()
 
 	if senderJID == (types.JID{}) && ci.Participant != nil {
 		senderJID = types.NewJID(ci.GetParticipant(), types.DefaultUserServer)
@@ -405,50 +349,81 @@ func (b *Bwhatsapp) handleDocumentMessage(msg *events.Message) {
 		ParentID: getParentIdFromCtx(ci),
 	}
 
+	b.mutex.RLock()
 	if avatarURL, exists := b.userAvatars[senderJID.String()]; exists {
 		rmsg.Avatar = avatarURL
 	}
+	b.mutex.RUnlock()
 
-	fileExt, err := mime.ExtensionsByType(imsg.GetMimetype())
+	// Download the document
+	data, err := b.wc.Download(msg.Info.MessageSource, dmsg)
 	if err != nil {
-		b.Log.Errorf("Mimetype detection error: %s", err)
-
+		b.Log.Errorf("document download failed: %s", err)
 		return
 	}
 
-	filename := fmt.Sprintf("%v", imsg.GetFileName())
-
-	b.Log.Debugf("Trying to download %s with extension %s and type %s", filename, fileExt, imsg.GetMimetype())
-
-	data, err := b.wc.Download(imsg)
-	if err != nil {
-		b.Log.Errorf("Download document message failed: %s", err)
-
-		return
-	}
-
-	// Move file to bridge storage
-	helper.HandleDownloadData(b.Log, &rmsg, filename, imsg.GetCaption(), "", &data, b.General)
-
-	b.Log.Debugf("<= Sending message from %s on %s to gateway", senderJID, b.Account)
-	b.Log.Debugf("<= Message is %#v", rmsg)
-
-	b.Remote <- rmsg
+	comment := "document " + dmsg.GetFileName()
+	helper.HandleDownloadData(b.Log, &rmsg, comment, dmsg.GetMimetype(), data, b.General)
+	b.Log.Debugf("<= Sending document message from %s on %s to gateway", senderJID, b.Account)
+	b.PostDocumentMessage(&rmsg) // Usare la funzione PostDocumentMessage per inviare il messaggio
 }
 
-func (b *Bwhatsapp) handleDelete(messageInfo *proto.ProtocolMessage) {
-	sender, _ := types.ParseJID(*messageInfo.Key.Participant)
+// HandleAudioMessage sent from WhatsApp, relay it to the bridge
+func (b *Bwhatsapp) handleAudioMessage(msg *events.Message) {
+	amsg := msg.Message.GetAudioMessage()
 
-	rmsg := config.Message{
-		Account:  b.Account,
-		Protocol: b.Protocol,
-		ID:       getMessageIdFormat(sender, *messageInfo.Key.ID),
-		Event:    config.EventMsgDelete,
-		Text:     config.EventMsgDelete,
-		Channel:  *messageInfo.Key.RemoteJID,
+	senderJID := msg.Info.Sender
+	senderName := b.getSenderName(msg.Info)
+	ci := amsg.GetContextInfo()
+
+	if senderJID == (types.JID{}) && ci.Participant != nil {
+		senderJID = types.NewJID(ci.GetParticipant(), types.DefaultUserServer)
 	}
 
-	b.Log.Debugf("<= Sending message from %s to gateway", b.Account)
-	b.Log.Debugf("<= Message is %#v", rmsg)
-	b.Remote <- rmsg
+	rmsg := config.Message{
+		UserID:   senderJID.String(),
+		Username: senderName,
+		Channel:  msg.Info.Chat.String(),
+		Account:  b.Account,
+		Protocol: b.Protocol,
+		Extra:    make(map[string][]interface{}),
+		ID:       getMessageIdFormat(senderJID, msg.Info.ID),
+		ParentID: getParentIdFromCtx(ci),
+	}
+
+	b.mutex.RLock()
+	if avatarURL, exists := b.userAvatars[senderJID.String()]; exists {
+		rmsg.Avatar = avatarURL
+	}
+	b.mutex.RUnlock()
+
+	// Download the audio
+	data, err := b.wc.Download(msg.Info.MessageSource, amsg)
+	if err != nil {
+		b.Log.Errorf("audio download failed: %s", err)
+		return
+	}
+
+	comment := "voice message"
+	helper.HandleDownloadData(b.Log, &rmsg, comment, amsg.GetMimetype(), data, b.General)
+	b.Log.Debugf("<= Sending audio message from %s on %s to gateway", senderJID, b.Account)
+	b.PostAudioMessage(&rmsg) // Usare la funzione PostAudioMessage per inviare il messaggio
+}
+
+// handleDelete handles message delete from WhatsApp, relays it to the bridge
+func (b *Bwhatsapp) handleDelete(msg *proto.ProtocolMessage) {
+	b.Log.Debugf("<= Sending delete message from %s on %s to gateway", b.Account, b.Protocol)
+	b.Log.Debugf("Deleting message %s", msg.GetKey().GetId())
+
+	b.Remote <- config.Message{
+		Event: config.EventMsgDelete,
+		ID:    msg.GetKey().GetId(),
+	}
+}
+
+func getParentIdFromCtx(ci *proto.ContextInfo) string {
+	if ci != nil && ci.QuotedMessageID != nil {
+		return *ci.QuotedMessageID
+	}
+	return ""
 }
