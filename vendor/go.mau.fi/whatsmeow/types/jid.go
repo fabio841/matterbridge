@@ -1,8 +1,6 @@
 // Copyright (c) 2021 Tulir Asokan
 //
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at http://mozilla.org/MPL/2.0/.
+// This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0. If a copy of the MPL was not distributed with this file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
 // Package types contains various structs and other types used by whatsmeow.
 package types
@@ -27,7 +25,7 @@ const (
 	HiddenUserServer  = "lid"
 	MessengerServer   = "msgr"
 	InteropServer     = "interop"
-	NewsletterServer  = "newsletter"
+	NewsletterServer  = "newsletter" // New server for newsletters
 	HostedServer      = "hosted"
 )
 
@@ -96,17 +94,16 @@ func (jid JID) SignalAddress() *signalProtocol.SignalAddress {
 		user = fmt.Sprintf("%s_%d", jid.User, agent)
 	}
 	return signalProtocol.NewSignalAddress(user, uint32(jid.Device))
-	// TODO use @lid suffix instead of agent?
-	//suffix := ""
-	//if jid.Server == HiddenUserServer {
-	//	suffix = "@lid"
-	//}
-	//return signalProtocol.NewSignalAddress(user, uint32(jid.Device), suffix)
 }
 
 // IsBroadcastList returns true if the JID is a broadcast list, but not the status broadcast.
 func (jid JID) IsBroadcastList() bool {
 	return jid.Server == BroadcastServer && jid.User != StatusBroadcastJID.User
+}
+
+// IsNewsletter returns true if the JID is associated with a newsletter.
+func (jid JID) IsNewsletter() bool {
+	return jid.Server == NewsletterServer
 }
 
 var botUserRegex = regexp.MustCompile(`^1313555\d{4}$|^131655500\d{2}$`)
